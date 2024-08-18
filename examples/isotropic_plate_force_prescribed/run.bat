@@ -1,0 +1,1 @@
+mpiexec -n 14 python ..\..\src\pd_solver.py body.csv neigh.csv config.yaml appliedb.csv appliedd.csv

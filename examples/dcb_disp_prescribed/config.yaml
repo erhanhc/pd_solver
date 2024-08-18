@@ -1,0 +1,5 @@
+max_iter: 1000
+failure: False
+t0 : 0.7
+delta : 1.5075
+dt : 1.0
