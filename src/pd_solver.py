@@ -64,18 +64,38 @@ class pd_solver:
         self.forceold = np.zeros_like(self.coord)
         self.bforce = np.zeros_like(self.coord)
         self.dilat = np.zeros_like(self.coord[:,0])
+        columns=['coordx',      'coordy',
+                'dispx',        'dispy',
+                'deformedx',    'deformedy',
+                'forcex',       'forcey',
+                'bforcex',      'bforcey',
+                'forceoldx',    'forceoldy',
+                'velhalfx',     'velhalfy',
+                'velhalfoldx',  'velhalfoldy',
+                'diix',         'diiy',
+                'dilat'
+                ]
         if self.config['failure']==True:
             self.damage_index = np.zeros_like(self.coord[:,0])
+            self.damage_index_ = np.zeros_like(self.damage_index)
             self.mus = np.ones_like(self.sc)
+            columns.append('damage_index')
+        self.df = DataFrame(columns=columns)
+
+        shape = (self.size,self.num_points)
+        self.dummy_size_points = np.zeros(shape=shape)
+
+        shape = (self.size,self.num_points,self.num_dofs)
+        self.dummy_size_points_dofs = np.zeros(shape=shape)
 
     def compute_damage(self):
-        self.damage_index_=np.zeros_like(self.damage_index)
+        self.damage_index_[:] = 0.0
         for curr in self.pd_points:
             f,t = self.from_to[curr]
             others = self.neighbors[f:t,1]
 
             sc = self.sc[f:t]
-            mu = self.mus[f:t].copy()
+            mu = self.mus[f:t]
 
             x = self.coord[others] - self.coord[curr]
             x_norm = np.linalg.norm(x,axis=1)
@@ -94,10 +114,9 @@ class pd_solver:
 
             self.damage_index_[curr] = 1 - ((self.mus[f:t]*self.volumes[others]).sum())/(self.volumes[others].sum())
         #Gather Damage Indices
-        shape = (self.size,self.num_points)
-        dummy = np.zeros(shape=shape,dtype=np.float64)
-        self.comm.Allgather(self.damage_index_.copy(),dummy)
-        self.damage_index = dummy.sum(axis=0).copy()
+        self.dummy_size_points[:] = 0
+        self.comm.Allgather(self.damage_index_.copy(),self.dummy_size_points)
+        self.damage_index[:] = self.dummy_size_points.sum(axis=0)
         #-----------------
 
     def apply_bc(self):
@@ -142,10 +161,9 @@ class pd_solver:
             self.dilat[curr] = (stretchs * Lambdas *self.volumes[others] * d * delta).sum(axis=0)
         #-----------------
         #Gather Dilat
-        shape = (self.size,self.num_points)
-        dummy = np.zeros(shape=shape,dtype=np.float64)
-        self.comm.Allgather(self.dilat.copy(),dummy)
-        self.dilat = dummy.sum(axis=0).copy()
+        self.dummy_size_points[:] = 0
+        self.comm.Allgather(self.dilat.copy(),self.dummy_size_points)
+        self.dilat[:] = self.dummy_size_points.sum(axis=0)
         #-----------------
 
     def compute_force(self):
@@ -179,10 +197,9 @@ class pd_solver:
             self.force[curr,:] = ((tij-tji) * (self.volumes[others]).reshape(len(others),1)).sum(axis=0)
             #-----------------
         #Gather Force
-        shape = (self.size,self.num_points,self.num_dofs)
-        dummy = np.zeros(shape=shape,dtype=np.float64)
-        self.comm.Allgather(self.force.copy(),dummy)
-        self.force = dummy.sum(axis=0).copy()
+        self.dummy_size_points_dofs[:]=0
+        self.comm.Allgather(self.force.copy(),self.dummy_size_points_dofs)
+        self.force[:] = self.dummy_size_points_dofs.sum(axis=0)
         #-----------------
 
     def ADR(self):
@@ -224,40 +241,45 @@ class pd_solver:
             self.velhalf[self.pd_points,:]=(a1 * self.velhalfold[self.pd_points] + a2 * (self.force[self.pd_points]+self.bforce[self.pd_points]) / self.dii[self.pd_points])/b1
         #-----------------
         #Gather Velhalf
-        shape = (self.size,self.num_points,self.num_dofs)
-        dummy = np.zeros(shape=shape,dtype=np.float64)
-        self.comm.Allgather(self.velhalf.copy(),dummy)
-        self.velhalf = dummy.sum(axis=0).copy()
+        self.dummy_size_points_dofs[:] = 0
+        self.comm.Allgather(self.velhalf.copy(),self.dummy_size_points_dofs)
+        self.velhalf[:] = self.dummy_size_points_dofs.sum(axis=0)
         #-----------------
 
     def update_state(self):
             self.disp += self.velhalf * self.config['dt']
-            self.velhalfold = self.velhalf.copy()
-            self.forceold = self.force.copy()
+            self.velhalfold[:] = self.velhalf
+            self.forceold[:] = self.force
             self.iter+=1
 
     def iterate_initializer(self):
-        self.dilat = np.zeros_like(self.coord[:,0])
-        self.force = np.zeros_like(self.coord)
-        self.velhalf = np.zeros_like(self.coord)
+        self.dilat[:] = 0.0
+        self.force[:] = 0.0
+        self.velhalf[:] = 0.0
+
 
     def output(self):
-        df = DataFrame()
-        df[['coordx','coordy']] = self.coord
-        df[['dispx','dispy']] = self.disp
-        df[['deformedx','deformedy']] = self.coord+self.disp
-        df[['forcex','forcey']] = self.force
-        df[['bforcex','bforcey']] = self.bforce
-        df[['forceoldx','forceoldy']] = self.forceold
-        df[['velhalfx','velhalfy']] = self.velhalf
-        df[['velhalfoldx','velhalfoldy']] = self.velhalfold
-        df[['diix','diiy']] = self.dii
-        df['dilat'] = self.dilat
+        self.logger.info(f'Outputing at iteration: {self.iter}')
+        if not hasattr(self,'df'):
+            self.df = DataFrame()
+        self.df[['coordx','coordy']] = self.coord
+        self.df[['dispx','dispy']] = self.disp
+        self.df[['deformedx','deformedy']] = self.coord+self.disp
+        self.df[['forcex','forcey']] = self.force
+        self.df[['bforcex','bforcey']] = self.bforce
+        self.df[['forceoldx','forceoldy']] = self.forceold
+        self.df[['velhalfx','velhalfy']] = self.velhalf
+        self.df[['velhalfoldx','velhalfoldy']] = self.velhalfold
+        self.df[['diix','diiy']] = self.dii
+        self.df['dilat'] = self.dilat
         if self.config['failure']:
-            df['damage_index'] = self.damage_index
+            self.df['damage_index'] = self.damage_index
+        self.df_cn = DataFrame(self.cn,columns = ['iter','cn'])
+
         fname  = f'output_{self.iter}.csv'
-        df.to_csv(fname,index=False)
-        df = DataFrame(self.cn,columns=['iter','cn'])
-        df.to_csv('cn.csv')
+        self.df.to_csv(fname,index=False)
+
+        self.df_cn.to_csv('cn.csv')
+        self.logger.info('Output done.')
 
 prog=pd_solver()
