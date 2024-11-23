@@ -5,6 +5,16 @@ import logging,os
 from pandas import DataFrame
 out_print = lambda text: os.system(f"ECHO {text}")
 
+def get_shared(comm,size,mpi_dtype):
+    if comm.Get_rank() == 0: 
+        nbytes = int(np.prod(size) * mpi_dtype.Get_size() )
+    else: 
+        nbytes = 0
+    win = MPI.Win.Allocate_shared(nbytes, mpi_dtype.Get_size(), comm=comm) 
+    buf, itemsize = win.Shared_query(0) 
+    assert itemsize == MPI.DOUBLE.Get_size() 
+    return np.ndarray(buffer=buf, dtype='d', shape=size)
+
 class pd_solver:
     logging.basicConfig(
         filename='run.log',
@@ -61,36 +71,75 @@ class pd_solver:
                     self.pd_points=self.family_list
                     self.reduction_indices = [int(self.from_to[curr][0]) - int(self.pd_interactions[0])  for curr in self.family_list]
                     self.reduction_indices.append(int(self.from_to[self.family_list[-1]][-1]- int(self.pd_interactions[0])))
+                    
                 INTERACTION_COUNTER = family_size
                 CURRENT_RANK+=1
                 FAMILY_COUNTER=FAMILY
+    # def mpi_setup_vec(self):
+    #     self.comm = MPI.COMM_WORLD
+    #     self.rank = self.comm.Get_rank()
+    #     self.size = self.comm.Get_size()
+    #     self.num_points,self.num_dofs = self.coord.shape
+    #     from_ = int((self.num_points/self.size)*self.rank)
+    #     to_   = int((self.num_points/self.size)*(self.rank+1))
+    #     self.pd_points = list(
+    #                     range(
+    #                         from_,
+    #                         to_ if to_<=self.num_points else self.num_points
+    #                         )
+    #                     )
+    #     self.family_list = self.pd_points
+    #     self.pd_interactions = np.array([self.from_to[self.pd_points[0],0],self.from_to[self.pd_points[-1],1]])
+
+    #     self.reduction_indices = [int(self.from_to[curr][0]) - int(self.pd_interactions[0])  for curr in self.pd_points]
+    #     self.reduction_indices.append(int(self.from_to[self.pd_points[-1]][-1]- int(self.pd_interactions[0])))
+
+    #     out_print(f'Process {self.rank} has pd interactions: {self.pd_interactions}, {self.pd_interactions[1]-self.pd_interactions[0]}')
+    #     out_print(f'Process {self.rank} has {len(self.pd_points)} families and {self.pd_interactions[1]-self.pd_interactions[0]} interactions. Family list starts from {self.pd_points[0]} to {self.pd_points[-1]}')
 
     def iterate_vec(self):
+        self.durations = []
         self.iter = 0
         self.cn = np.zeros(shape=self.config['max_iter'])
         while self.iter<=self.config['max_iter']:
-            self.apply_bc()
+            
+            if self.rank==0:
+                self.apply_bc()
+            self.comm.Barrier()
+            
             self.iterate_initializer_vec()
+
             if self.config['failure']==True:
                 self.compute_damage_vec()
+
             self.compute_dilation_vec()
+        
             self.compute_force_vec()
-            self.ADR()
-            if self.rank==0 and self.iter % 200 == 199:
+        
+            if self.rank==0:
+                self.ADR_s()
+            self.comm.Barrier()
+            
+            if self.rank==0 and self.iter % 2000 == 1999:
                 self.output()
+            
             self.update_state()
+            
+        
 
     def initialize_vec(self):
         self.delta = np.float64(self.config['delta'])
 
-        self.disp       = np.zeros_like(self.coord)
-        self.velhalf    = np.zeros_like(self.coord)
-        self.velhalfold = np.zeros_like(self.coord)
-        self.force      = np.zeros_like(self.coord)
-        self.forceold   = np.zeros_like(self.coord)
-        self.bforce     = np.zeros_like(self.coord)
-        self.dilat      = np.zeros_like(self.coord[:,0])
-
+        self.disp       = get_shared(self.comm,self.coord.shape,MPI.DOUBLE)
+        self.bforce     = get_shared(self.comm,self.coord.shape,MPI.DOUBLE)
+        self.velhalf    = get_shared(self.comm,self.coord.shape,MPI.DOUBLE)
+        self.velhalfold = get_shared(self.comm,self.coord.shape,MPI.DOUBLE)
+        self.force      = get_shared(self.comm,self.coord.shape,MPI.DOUBLE)
+        self.forceold   = get_shared(self.comm,self.coord.shape,MPI.DOUBLE)
+        self.dilat      = get_shared(self.comm,self.coord.shape[0],MPI.DOUBLE)
+        
+        self.comm.Barrier()
+        
         f = self.pd_interactions[0]
         t = self.pd_interactions[1]
 
@@ -102,7 +151,6 @@ class pd_solver:
         self.volume_curr    = self.volumes[self.neighbors[f:t,0]]
         self.volume_other   = self.volumes[self.neighbors[f:t,1]]
         self.volume_other_  = np.append(self.volume_other,0)
-        
 
         self.eta        = np.zeros_like(self.xi)
         self.y          = np.zeros_like(self.xi)
@@ -117,37 +165,29 @@ class pd_solver:
         self.dilat_curr = np.zeros_like(self.volume_curr)
         self.dilat_other = np.zeros_like(self.volume_curr)
 
-        shape           = (self.size,self.num_points)
-        self.dummy_scal = np.zeros(shape=shape,dtype=np.float64)
-
-        shape           = (self.size,self.num_points,self.num_dofs)
-        self.dummy_vec  = np.zeros(shape=shape,dtype=np.float64)
-
         if self.config['failure']==True:
-            self.damage_index = np.zeros_like(self.coord[:,0])
-            self.damage_index_=np.zeros_like(self.damage_index)
-            self.mus = np.ones_like(self.xi_norm)
-            self.damage_index_kj_= np.append(np.zeros_like(self.xi_norm),0)
+            # self.damage_index = np.zeros_like(self.coord[:,0])
+            self.damage_index       = get_shared(self.comm,self.coord.shape[0],MPI.DOUBLE)
+            self.damage_index[:]    = np.zeros_like(self.damage_index)
+            
+            self.mus            = np.ones_like(self.xi_norm)
+            self.damage_index_kj= np.append(np.zeros_like(self.xi_norm),0)
+
 
 
     def compute_damage_vec(self):
         #Compute Damage Index
         [f,t]               = self.pd_interactions
-        self.mus[:] = ((self.stretch<self.sc[f:t])&(self.mus==1)).astype(int)
+        #self.stretch<sc & self.mus==1
+        self.mus[:] = ((self.stretch<self.sc[f:t])&(self.mus==1)).astype(float)
+
         self.a[f:t]*=self.mus
         self.b[f:t]*=self.mus
         self.d[f:t]*=self.mus
-        self.damage_index_kj_[:-1] = self.mus*self.volume_other
-        self.damage_index_[:]=0.0
-
-        self.damage_index_[self.family_list[0]:self.family_list[-1]+1] = 1.0 - np.add.reduceat(self.damage_index_kj_,self.reduction_indices,axis=0)[:-1] / np.add.reduceat(self.volume_other_,self.reduction_indices,axis=0)[:-1]
-        #Gather Damage Index
-        [f,t]           =  self.pd_interactions
-        # shape           = (self.size,self.num_points)
-        # dummy           = np.zeros(shape=shape,dtype=np.float64)
-        self.dummy_scal[:] = 0.0
-        self.comm.Allgather( self.damage_index_.copy() , self.dummy_scal )
-        self.damage_index[:] = self.dummy_scal.sum(axis=0)
+        
+        self.damage_index_kj[:-1] = self.mus*self.volume_other
+        self.damage_index[self.family_list[0]:self.family_list[-1]+1] = 1.0 - np.add.reduceat(self.damage_index_kj,self.reduction_indices,axis=0)[:-1] / np.add.reduceat(self.volume_other_,self.reduction_indices,axis=0)[:-1]
+        self.comm.Barrier()
         #-----------------
 
     def apply_bc(self):
@@ -179,20 +219,15 @@ class pd_solver:
     def compute_dilation_vec(self):
         #Compute Dilation
         [f,t]               = self.pd_interactions
-        self.dilatkj[:-1]     = self.stretch  * self.lambdas *self.volume_other * self.d[f:t] *self.delta
+        self.dilatkj[:-1]   = self.stretch  * self.lambdas *self.volume_other * self.d[f:t] *self.delta
         self.dilat[self.family_list[0]:self.family_list[-1]+1]  = np.add.reduceat(self.dilatkj,self.reduction_indices)[:-1]
-        #Gather Dilat
-        [f,t]           =  self.pd_interactions
-        # shape           = (self.size,self.num_points)
-        # dummy           = np.zeros(shape=shape,dtype=np.float64)
-        self.dummy_scal[:] = 0.0
-        self.comm.Allgather( self.dilat.copy() , self.dummy_scal )
-        self.dilat[:]   = self.dummy_scal.sum(axis=0)
-        self.dilat_curr[:]=  self.dilat[self.neighbors[f:t,0]]
+        self.comm.Barrier()
+        self.dilat_curr[:]  =  self.dilat[self.neighbors[f:t,0]]
         self.dilat_other[:] =  self.dilat[self.neighbors[f:t,1]]
         #-----------------
 
     def compute_force_vec(self):
+        #Compute Force
         [f,t]           =  self.pd_interactions
         A               = 2 * self.a[f:t] *  self.d[f:t] * self.delta * self.lambdas / self.xi_norm * self.dilat_curr    + 2 *  self.b[f:t] * self.delta * self.stretch
         B               = 2 * self.a[f:t] *  self.d[f:t] * self.delta * self.lambdas / self.xi_norm * self.dilat_other   + 2 *  self.b[f:t] * self.delta * self.stretch
@@ -200,14 +235,7 @@ class pd_solver:
         tji             =   -self.y * ( B / self.y_norm).reshape(self.y_norm.shape[0],1)
         self.forcekj[:-1,:] = (tij-tji) * (self.volume_other ).reshape(len(self.volume_other),1)
         self.force[self.family_list[0]:self.family_list[-1]+1,:] = np.add.reduceat(self.forcekj,self.reduction_indices,axis=0)[:-1]
-        
-        #Gather Force
-        [f,t]            =  self.pd_interactions
-        # shape            = (self.size,self.num_points,self.num_dofs)
-        # dummy            = np.zeros(shape=shape,dtype=np.float64)
-        self.dummy_vec[:] = 0.0
-        self.comm.Allgather( self.force.copy() , self.dummy_vec )
-        self.force[:,:]  = self.dummy_vec.sum(axis=0)
+        self.comm.Barrier()
         #-----------------
 
     def ADR(self):
@@ -229,8 +257,8 @@ class pd_solver:
             K_ii /= self.velhalfold[f:t].ravel()[non_zero_velhalf_ind]
             
             
-            a1 = (np.pow(self.disp[f:t].ravel()[non_zero_velhalf_ind],2.0) * K_ii).sum(axis=0)
-            b1 = np.pow(self.disp[f:t].ravel(),2.0).sum()
+            a1 = (np.power(self.disp[f:t].ravel()[non_zero_velhalf_ind],2.0) * K_ii).sum(axis=0)
+            b1 = np.power(self.disp[f:t].ravel(),2.0).sum()
             a1 = self.comm.allreduce(a1,op=MPI.SUM)
             b1 = self.comm.allreduce(b1,op=MPI.SUM)
 
@@ -247,30 +275,57 @@ class pd_solver:
             a2 = 2 * dt
             b1 = 2 + cn * dt
             self.velhalf[f:t,:]=(a1 * self.velhalfold[f:t] + a2 * (self.force[f:t]+self.bforce[f:t]) / self.dii[f:t])/b1
-        #-----------------
-        #Gather Velhalf
-        # shape = (self.size,self.num_points,self.num_dofs)
-        # dummy = np.zeros(shape=shape,dtype=np.float64)
-        self.dummy_vec[:] = 0.0
-        self.comm.Allgather(self.velhalf.copy(),self.dummy_vec)
-        self.velhalf[:,:] = self.dummy_vec.sum(axis=0)
-        #-----------------
+        self.comm.Barrier()
+
+    def ADR_s(self):
+        dt = self.config['dt']
+        #ADR
+        if self.iter==0:
+            self.velhalf[:]= (self.force+self.bforce) * dt / self.dii / 2
+        else:
+            cn = 0.0
+            a1 = 0.0
+            b1 = 0.0
+
+            non_zero_velhalf_ind = np.where(self.velhalfold.ravel()!=0.0)[0]
+
+            K_ii = - (self.force - self.forceold) /self.dii / dt
+            K_ii = K_ii.ravel()[non_zero_velhalf_ind]
+            K_ii /= self.velhalfold.ravel()[non_zero_velhalf_ind]
+            
+            
+            a1 = (np.power(self.disp.ravel()[non_zero_velhalf_ind],2.0) * K_ii).sum(axis=0)
+            b1 = np.power(self.disp.ravel(),2.0).sum()
+            
+            if not b1==0.0:
+                if a1/b1>0.0:
+                    cn = 2 * np.sqrt(a1/b1)
+                else:
+                    cn = 0.0
+            else:
+                cn = 0.0
+            if cn>2.0:
+                cn = 1.9
+            a1 = 2 - cn * dt
+            a2 = 2 * dt
+            b1 = 2 + cn * dt
+            self.velhalf[:]=(a1 * self.velhalfold + a2 * (self.force+self.bforce) / self.dii)/b1
 
     def update_state(self):
-            self.disp += self.velhalf * self.config['dt']
+            if self.rank==0:
+                self.disp += self.velhalf * self.config['dt']
             self.velhalfold[:] = self.velhalf
             self.forceold[:] = self.force
             self.iter+=1
-
+            self.comm.Barrier()
+            if self.rank==0:
+                self.dilat[:]   = 0.0
+                self.force[:]   = 0.0
+                self.velhalf[:] = 0.0
 
     def iterate_initializer_vec(self):
-        self.dilat[:]      = 0.0
-        self.force[:]      = 0.0
-        self.velhalf[:]    = 0.0
-
         f = self.pd_interactions[0]
         t = self.pd_interactions[1]
-        
 
         self.eta[:]         = self.disp[self.neighbors[f:t,1]] - self.disp[self.neighbors[f:t,0]]
         self.y[:]           = self.xi + self.eta
@@ -280,7 +335,7 @@ class pd_solver:
         self.lambdas[:]     = (self.y * self.xi).sum(axis=1) / self.y_norm / self.xi_norm
         
     def output(self):
-        if not hasattr(self,'output_df'):
+        if not hasattr(self,'df'):
             self.df = DataFrame()
         self.df = DataFrame()
         self.df[['coordx','coordy']] = self.coord
